@@ -1,0 +1,6 @@
+cell-gears
+torch_geometric
+pertpy
+pytorch_lightning
+jupyterlab
+ipywidgets
