@@ -4,3 +4,4 @@ pertpy
 pytorch_lightning
 jupyterlab
 ipywidgets
+./bicycle
