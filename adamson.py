@@ -23,7 +23,7 @@ from bicycle.callbacks import GenerateCallback
 SEED = 0
 
 PERTURBATION_KEY = "perturbation"
-MAX_GENES = 200          # cap on modelled genes (perturbed genes always kept)
+MAX_GENES = 200
 N_TEST_PERTURBATIONS = 5 # held-out perturbations for the test set
 VALIDATION_SIZE = 0.2
 
