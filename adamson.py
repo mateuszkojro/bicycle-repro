@@ -1,28 +1,4 @@
 #!/usr/bin/env python
-"""
-BICYCLE replication on the Adamson 2016 UPR Perturb-seq dataset.
-
-Cleaned-up version of adamson_replication.py with the following fixes:
-  1. Modelled genes = perturbed genes + highly variable response genes
-     (previously only perturbed genes were kept, dropping all causal signal).
-  2. Imperfect interventions (CRISPRi knockdown, not knockout).
-  3. Dropped/unparsed perturbation labels are reported, not silently discarded.
-  4. Sanity check that adata.X contains raw integer counts (Multinomial likelihood).
-  5. Checkpointing on valid_loss + optional early stopping & SWA re-enabled.
-  6. Loss scales, optimizer, and all hyperparameters consolidated in one CONFIG block.
-  7. Held-out test perturbations chosen explicitly (seeded), not "last 10 in var order".
-  8. Plotting callback throttled (was every epoch -> overhead + matplotlib memory leak).
-  9. Single source of truth for batch size; dead synthetic-data config removed.
- 10. Correct device detection (cuda / mps / cpu); main() guard for Windows workers.
- 11. MLflow experiment tracking: config/hyperparameters, per-epoch train/valid
-     metrics (via a Lightning MLFlowLogger attached alongside DictLogger),
-     held-out test metrics, and output artifacts (checkpoint + plot) are all
-     logged to a single MLflow run.
- 12. Patched DictLogger.log_hyperparams to tolerate a plain dict for
-     hparams_initial (some pytorch_lightning versions pass a dict instead of
-     an AttributeDict/Namespace, and vars() blows up on a plain dict).
-"""
-
 import time
 from pathlib import Path
 from types import MethodType
@@ -46,19 +22,18 @@ from bicycle.callbacks import GenerateCallback
 
 SEED = 0
 
-# --- data ---
 PERTURBATION_KEY = "perturbation"
 MAX_GENES = 200          # cap on modelled genes (perturbed genes always kept)
 N_TEST_PERTURBATIONS = 5 # held-out perturbations for the test set
 VALIDATION_SIZE = 0.2
 
-# --- training ---
+# training setup
 LR = 1e-3
 BATCH_SIZE = 2048
 N_EPOCHS = 1000
-PRETRAIN_EPOCHS = 50     # likelihood-only warm-up (was 1 epoch = a few steps)
+PRETRAIN_EPOCHS = 50
 OPTIMIZER = "adam"
-OPTIMIZER_KWARGS = {"betas": (0.9, 0.999)}  # was (0.5, 0.9): too noisy late in training
+OPTIMIZER_KWARGS = {"betas": (0.9, 0.999)}  # in the notebook (0.5, 0.9) change to higher value in noisy data?
 GRADIENT_CLIP_VAL = 1.0
 CHECK_VAL_EVERY_N_EPOCH = 10
 EARLY_STOPPING = True
@@ -67,41 +42,39 @@ EARLY_STOPPING_MIN_DELTA = 0.01
 USE_SWA = False
 SWA_EPOCH_START = 250
 SWA_LR = 0.01
-NUM_WORKERS = 4          # set to 0 if you hit multiprocessing issues
+NUM_WORKERS = 4 # TODO: change on macos
 
-# --- loss scales (watch these if results degrade late in training) ---
 SCALE_KL = 0.1
-SCALE_L1 = 0.1           # if beta collapses to all-zero late in training, lower this
+SCALE_L1 = 0.1
 SCALE_LYAPUNOV = 0.1
 SCALE_SPECTRAL = 0.0
 
-# --- model ---
-X_DISTRIBUTION = "Multinomial"   # requires raw counts in adata.X (checked below)
-USE_LATENTS = True               # library-size latents for count data
+# model
+X_DISTRIBUTION = "Multinomial" # requires raw counts, need to check
+USE_LATENTS = True # library-size latents for count data
 USE_ENCODER = False
-PERFECT_INTERVENTIONS = False    # Adamson = CRISPRi knockdown -> imperfect
+PERFECT_INTERVENTIONS = False # Adamson is CRISPRi knockdown so imperfect
 LYAPUNOV_PENALTY = True
-PLOT_EVERY_N_EPOCHS = 10        # was 1: huge overhead + figure memory lea
+PLOT_EVERY_N_EPOCHS = 10
 
-# --- experiment tracking (MLflow) ---
-MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"    # local file store; point at a server/Databricks URI to log remotely
+# experiment tracking
+MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
 MLFLOW_EXPERIMENT_NAME = "bicycle-adamson-upr"
-MLFLOW_RUN_NAME = None                   # None -> MLflow auto-generates one
-MLFLOW_LOG_MODEL = True                 # True -> also log the best checkpoint as an MLflow pytorch model artifact
+MLFLOW_RUN_NAME = None
+MLFLOW_LOG_MODEL = True
 
 
 def pick_device():
     if torch.cuda.is_available():
         return "cuda", torch.device("cuda")
+    # TODO: Why is MPS not helping?
     if torch.backends.mps.is_available():
         return "mps", torch.device("mps")
     return "cpu", torch.device("cpu")
 
 
 def get_config_dict():
-    """Snapshot of the CONFIG block above (all-caps module-level constants),
-    for logging as MLflow run params. Non-primitive values (Path, dict, tuple)
-    are stringified since MLflow params must be scalars."""
+    """ChatGPT magic to get the constants"""
     import sys
     mod = sys.modules[__name__]
     cfg = {
@@ -126,11 +99,6 @@ def numeric_metrics(d):
 
 
 def _dict_logger_log_hyperparams(self, params):
-    """Drop-in replacement for DictLogger.log_hyperparams that tolerates a
-    plain dict for `params` in addition to a Namespace/AttributeDict. Some
-    pytorch_lightning versions pass a plain dict as hparams_initial, and the
-    stock implementation (`vars(params)`) raises TypeError on that, crashing
-    Trainer.fit() before any training step runs."""
     self.hyperparams = dict(params) if isinstance(params, dict) else vars(params)
 
 
@@ -144,7 +112,7 @@ CONTROL_LABELS = {"control", "ctrl", "non-targeting"}
 
 
 def pert_to_gene(label, control_substrings=("(mod)",), guide_prefixes=("pDS", "pBA")):
-    """Map 'OST4_pDS353' -> 'OST4', controls -> 'control', missing/* -> None."""
+    """Map 'OST4_pDS353' to 'OST4' controls to 'control' and missing/* to None."""
     if pd.isna(label):
         return None
     s = str(label).strip()
@@ -161,7 +129,6 @@ def pert_to_gene(label, control_substrings=("(mod)",), guide_prefixes=("pDS", "p
 
 
 def select_response_genes(ad: AnnData, perturbed_genes, max_genes: int):
-    """Perturbed genes + most variable remaining genes, up to max_genes total."""
     n_hvg = max(0, max_genes - len(perturbed_genes))
     if n_hvg == 0 or ad.n_vars <= len(perturbed_genes):
         return sorted(set(perturbed_genes) & set(ad.var_names))
@@ -185,7 +152,6 @@ def prepare_bicycle_from_adata(
 ):
     ad = adata.copy()
 
-    # --- parse perturbation labels, reporting anything dropped ---
     pert = ad.obs[perturbation_key]
     target = pert.map(pert_to_gene)
     n_before = ad.n_obs
@@ -201,7 +167,7 @@ def prepare_bicycle_from_adata(
     missing = [g for g in perturbed if g not in ad.var_names]
     if missing:
         raise ValueError(
-            "Perturbed genes not in adata.var_names (map IDs to symbols first): "
+            "Perturbed genes not in adata.var_names"
             f"{missing[:20]}"
         )
 
@@ -228,11 +194,9 @@ def prepare_bicycle_from_adata(
 
     X = ad.X.toarray() if hasattr(ad.X, "toarray") else np.asarray(ad.X)
 
-    # --- FIX #4: Multinomial likelihood needs raw integer counts ---
     if not np.allclose(X, np.round(X)):
         raise ValueError(
-            "adata.X is not integer-valued, but x_distribution='Multinomial' "
-            "requires raw counts. Reload raw data or use a Gaussian likelihood."
+            "mitinomial requires raw integer counts"
         )
     samples = torch.tensor(X, dtype=torch.float32)
 
@@ -336,19 +300,11 @@ def main():
                 loader.num_workers = NUM_WORKERS
                 loader.pin_memory = accelerator == "cuda"
 
-        # ---------------- model ----------------
         mask = get_diagonal_mask(n_genes, device)
 
-        # Only pass kwargs your bicycle version actually accepts (the original
-        # script defined optimizer_kwargs / intervention_type_inference but never
-        # passed them, so we check the signature first).
-        import inspect
-        _sig = inspect.signature(BICYCLE.__init__).parameters
         extra_kwargs = {}
-        if "optimizer_kwargs" in _sig:
-            extra_kwargs["optimizer_kwargs"] = OPTIMIZER_KWARGS
-        if "intervention_type_inference" in _sig:
-            extra_kwargs["intervention_type_inference"] = "dCas9"
+        extra_kwargs["optimizer_kwargs"] = OPTIMIZER_KWARGS
+        extra_kwargs["intervention_type_inference"] = "dCas9"
 
         model = BICYCLE(
             LR,
@@ -378,15 +334,7 @@ def main():
         )
         model = model.to(device)
 
-        # ---------------- callbacks / logging ----------------
-        # FIX #12: use the patched DictLogger constructor so log_hyperparams
-        # doesn't crash Trainer.fit() on this pytorch_lightning version.
         dlogger = make_dict_logger()
-        # FIX #11: attach an MLFlowLogger to the *same* run as the outer
-        # mlflow.start_run() above (via run_id) so every model.log(...) call
-        # inside BICYCLE's training/validation steps (train_loss, valid_loss,
-        # nll, kl, l1, lyapunov, ...) streams straight into this MLflow run,
-        # right alongside the config params and final artifacts.
         mlf_logger = MLFlowLogger(
             experiment_name=MLFLOW_EXPERIMENT_NAME,
             tracking_uri=MLFLOW_TRACKING_URI,
@@ -402,7 +350,6 @@ def main():
                 true_beta=None,
                 labels=genes,
             ),
-            # FIX #5: keep the best model instead of "whatever epoch 10k was"
             pl.callbacks.ModelCheckpoint(
                 dirpath=str(OUTPUT_DIR / "checkpoints"),
                 filename="{epoch}",
@@ -415,7 +362,7 @@ def main():
                 save_on_train_epoch_end=True,
             ),
         ]
-        if USE_SWA:
+        if USE_SWA: # TODO this is not working
             from pytorch_lightning.callbacks import StochasticWeightAveraging
             callbacks.append(StochasticWeightAveraging(swa_lrs=SWA_LR,
                                                        swa_epoch_start=SWA_EPOCH_START))
@@ -438,7 +385,6 @@ def main():
                 default_root_dir=str(OUTPUT_DIR),
             )
 
-        # ---------------- FIX #8: real likelihood-only warm-up ----------------
         if PRETRAIN_EPOCHS > 0:
             print(f"[pretrain] likelihood-only for {PRETRAIN_EPOCHS} epochs")
             model.train_only_likelihood = True
@@ -448,14 +394,12 @@ def main():
             model.train_only_likelihood = False
             print("[pretrain] done - switching to full BICYCLE loss")
 
-        # ---------------- main training ----------------
         trainer = make_trainer(N_EPOCHS)
         try:
             trainer.fit(model, train_loader, validation_loader)
         except Exception as e:
             print("Error - stopping:", e)
 
-        # ---------------- evaluate best checkpoint on held-out perturbations ----------------
         best = trainer.checkpoint_callback.best_model_path
         best_score = trainer.checkpoint_callback.best_model_score
         print(f"[done] best checkpoint: {best} (valid_loss={best_score})")
@@ -479,7 +423,7 @@ def main():
             mlflow.log_artifact(str(out_png), artifact_path="plots")
 
         print(f"[mlflow] run complete: {run.info.run_id} "
-              f"(view with `mlflow ui --backend-store-uri {MLFLOW_TRACKING_URI}`)")
+              f"(`mlflow ui --backend-store-uri {MLFLOW_TRACKING_URI}`)")
 
 
 if __name__ == "__main__":
